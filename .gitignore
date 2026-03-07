@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Recordings (audio data)
+server/recordings/*.raw
+server/recordings/*.wav
+server/recordings/*.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+firmware/*/build/
