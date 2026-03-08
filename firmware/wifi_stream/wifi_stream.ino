@@ -28,7 +28,7 @@
 // ⚠️  CONFIGURE THESE BEFORE FLASHING
 // ============================================================
 const char* WIFI_SSID   = "103";
-const char* WIFI_PASS   = "YOUR_PASSWORD";     // ← PUT YOUR WIFI PASSWORD HERE
+const char* WIFI_PASS   = "vanitas14850";     // ← PUT YOUR WIFI PASSWORD HERE
 const char* SERVER_IP   = "10.0.0.28";
 const int   SERVER_PORT = 8080;
 // ============================================================

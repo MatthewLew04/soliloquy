@@ -1,5 +1,10 @@
 # Dependencies
 node_modules/
+server/emotion_venv/
+__pycache__/
+
+# Environment (API keys)
+.env
 
 # Recordings (audio data)
 server/recordings/*.raw
