@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Soliloquy Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}
+.header{background:linear-gradient(135deg,#12121a,#1a1a2e);padding:14px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #222}
+.header h1{font-size:20px;font-weight:600;background:linear-gradient(90deg,#6c5ce7,#a29bfe);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.status-dot{width:10px;height:10px;border-radius:50%;background:#555;animation:none}
+.status-dot.live{background:#00ff88;box-shadow:0 0 8px #00ff8866;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px;max-height:calc(100vh - 56px);overflow:auto}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:#12121a;border:1px solid #1e1e2e;border-radius:12px;overflow:hidden}
+.card-title{padding:10px 16px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:#888;border-bottom:1px solid #1e1e2e;display:flex;justify-content:space-between;align-items:center}
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:#1e1e2e}
+.stat{background:#12121a;padding:12px 8px;text-align:center}
+.stat .val{font-size:20px;font-weight:700;color:#a29bfe}
+.stat .lbl{font-size:10px;color:#666;margin-top:3px}
+#transcript{padding:10px 14px;height:320px;overflow-y:auto;font-size:13px;line-height:1.6}
+#transcript .line{padding:3px 0;border-bottom:1px solid #0a0a0f;display:flex;gap:8px;align-items:baseline}
+#transcript .speaker{color:#6c5ce7;font-weight:600;white-space:nowrap}
+#transcript .text{flex:1}
+#transcript .emo-badge{font-size:11px;padding:1px 6px;border-radius:8px;background:#1a1a2e;white-space:nowrap;animation:fadeIn .3s}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.photos{padding:10px;display:flex;flex-wrap:wrap;gap:6px;max-height:200px;overflow-y:auto}
+.photos img{width:100px;height:75px;object-fit:cover;border-radius:6px;border:1px solid #222;cursor:pointer;transition:transform .2s}
+.photos img:hover{transform:scale(1.05);border-color:#6c5ce7}
+.photos .empty{color:#444;font-size:13px;padding:30px;text-align:center;width:100%}
+#sessions{padding:10px 14px;max-height:180px;overflow-y:auto}
+.session-item{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #1a1a2e;font-size:12px;cursor:pointer}
+.session-item:hover{color:#a29bfe}
+.session-item .meta{color:#555}
+.device-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;padding:10px}
+.ds{text-align:center;padding:8px;background:#0a0a0f;border-radius:8px}
+.ds .v{font-size:16px;font-weight:700;color:#00ff88}
+.ds .l{font-size:9px;color:#555;margin-top:2px}
+.emo-dist{padding:10px 14px}
+.emo-bar{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px}
+.emo-bar .emoji{width:24px;text-align:center}
+.emo-bar .bar-bg{flex:1;height:14px;background:#0a0a0f;border-radius:7px;overflow:hidden}
+.emo-bar .bar-fill{height:100%;border-radius:7px;transition:width .5s}
+.emo-bar .cnt{width:30px;text-align:right;color:#666;font-size:11px}
+#summary-card{display:none}
+#summary{padding:14px 16px;font-size:13px;line-height:1.7;color:#ccc;white-space:pre-wrap}
+#summary strong{color:#a29bfe}
+.generating{color:#888;font-style:italic;padding:20px;text-align:center}
+</style></head>
+<body>
+<div class="header">
+  <div class="status-dot" id="dot"></div>
+  <h1>Soliloquy</h1>
+  <span id="uptime" style="margin-left:auto;font-size:13px;color:#555">Disconnected</span>
+  <button id="stop-btn" onclick="endSession()" style="background:#ff4757;color:#fff;border:none;padding:6px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;display:none">End Session</button>
+</div>
+<div class="grid">
+  <div class="card" style="grid-column:1/-1">
+    <div class="card-title">Session Stats</div>
+    <div class="stats-grid">
+      <div class="stat"><div class="val" id="s-words">0</div><div class="lbl">Words</div></div>
+      <div class="stat"><div class="val" id="s-utts">0</div><div class="lbl">Utterances</div></div>
+      <div class="stat"><div class="val" id="s-photos">0</div><div class="lbl">Photos</div></div>
+      <div class="stat"><div class="val" id="s-audio">0</div><div class="lbl">Audio MB</div></div>
+      <div class="stat"><div class="val" id="s-emo">--</div><div class="lbl">Top Emotion</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Live Transcript</div>
+    <div id="transcript"><div style="color:#444;padding:40px;text-align:center">Waiting for connection...</div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Emotion Distribution</div>
+    <div class="emo-dist" id="emo-dist"><div style="color:#444;font-size:13px;padding:30px;text-align:center">No emotion data yet</div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Photos</div>
+    <div class="photos" id="photos"><div class="empty">No photos yet</div></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Device Health</div>
+    <div class="device-stats" id="device-stats">
+      <div class="ds"><div class="v" id="d-heap">--</div><div class="l">Free Heap</div></div>
+      <div class="ds"><div class="v" id="d-psram">--</div><div class="l">Free PSRAM</div></div>
+      <div class="ds"><div class="v" id="d-rssi">--</div><div class="l">WiFi dBm</div></div>
+      <div class="ds"><div class="v" id="d-temp">--</div><div class="l">CPU Temp</div></div>
+      <div class="ds"><div class="v" id="d-up">--</div><div class="l">Uptime</div></div>
+    </div>
+  </div>
+  <div class="card" style="grid-column:1/-1" id="summary-card">
+    <div class="card-title">Conversation Summary <span style="font-size:10px;color:#6c5ce7;font-weight:400">powered by Gemini</span></div>
+    <div id="summary"><div class="generating">✨ Generating summary...</div></div>
+  </div>
+  <div class="card" style="grid-column:1/-1">
+    <div class="card-title">Past Sessions</div>
+    <div id="sessions"><div style="color:#444;font-size:13px;padding:20px;text-align:center">Loading...</div></div>
+  </div>
+</div>
+<script>
+const es = new EventSource('/events');
+const $=id=>document.getElementById(id);
+let startTime=null;
+const emotions={};
+const emoColors={angry:'#ff6b6b',happy:'#ffd93d',sad:'#74b9ff',fearful:'#a29bfe',disgusted:'#55efc4',surprised:'#fd79a8',neutral:'#636e72',unknown:'#555'};
+const emoEmoji={angry:'\u{1f621}',happy:'\u{1f60a}',sad:'\u{1f622}',fearful:'\u{1f630}',disgusted:'\u{1f922}',surprised:'\u{1f632}',neutral:'\u{1f610}',unknown:'\u{2753}'};
+
+es.addEventListener('session', e => {
+  const d=JSON.parse(e.data);
+  $('dot').classList.add('live');
+  $('stop-btn').style.display='inline-block';
+  startTime=d.startTime;
+  Object.keys(emotions).forEach(k=>delete emotions[k]);
+  updateStats(d);
+});
+
+es.addEventListener('transcript', e => {
+  const d=JSON.parse(e.data);
+  const t=$('transcript');
+  if(t.querySelector('.empty,div[style]'))t.innerHTML='';
+  const el=document.createElement('div');
+  el.className='line';
+  el.dataset.id=d.id;
+  el.innerHTML='<span class="speaker">'+d.speaker+'</span><span class="text">'+d.text+'</span>';
+  t.appendChild(el);
+  t.scrollTop=t.scrollHeight;
+});
+
+es.addEventListener('emotion', e => {
+  const d=JSON.parse(e.data);
+  const line=document.querySelector('#transcript .line[data-id="'+d.id+'"]');
+  if(line){
+    const badge=document.createElement('span');
+    badge.className='emo-badge';
+    badge.style.borderLeft='3px solid '+(emoColors[d.emotion]||'#555');
+    badge.textContent=d.emoji+' '+d.emotion+' '+d.score.toFixed(2);
+    line.appendChild(badge);
+  }
+  emotions[d.emotion]=(emotions[d.emotion]||0)+1;
+  renderEmotionDist();
+});
+
+es.addEventListener('photo', e => {
+  const d=JSON.parse(e.data);
+  const p=$('photos');
+  if(p.querySelector('.empty'))p.innerHTML='';
+  const img=document.createElement('img');
+  img.src='/photos/'+d.filename;
+  img.title=d.filename;
+  img.onclick=()=>window.open(img.src);
+  p.prepend(img);
+});
+
+es.addEventListener('stats', e => { updateStats(JSON.parse(e.data)); });
+
+es.addEventListener('device', e => {
+  const d=JSON.parse(e.data);
+  $('d-heap').textContent=d.heap||'--';
+  $('d-psram').textContent=d.psram||'--';
+  $('d-rssi').textContent=d.rssi||'--';
+  $('d-temp').textContent=d.temp||'--';
+  $('d-up').textContent=d.uptime||'--';
+});
+
+es.addEventListener('disconnect', e => {
+  $('dot').classList.remove('live');
+  $('stop-btn').style.display='none';
+  $('uptime').textContent='Session ended';
+  startTime=null;
+  // Show summary card with loading state
+  $('summary-card').style.display='block';
+  $('summary').innerHTML='<div class="generating">\u2728 Generating summary...</div>';
+  loadSessions();
+});
+
+function updateStats(d){
+  if(!d)return;
+  $('s-words').textContent=d.wordCount||0;
+  $('s-utts').textContent=d.utteranceCount||0;
+  $('s-photos').textContent=d.photoCount||0;
+  $('s-audio').textContent=d.audioMB||'0';
+  if(d.emotions){
+    const top=Object.entries(d.emotions).sort((a,b)=>b[1]-a[1])[0];
+    $('s-emo').textContent=top?(emoEmoji[top[0]]||'')+' '+top[0]:'--';
+  }
+}
+
+es.addEventListener('summary', e => {
+  const d=JSON.parse(e.data);
+  const el=$('summary');
+  // Convert markdown bold to HTML
+  el.innerHTML=d.summary.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+});
+
+function renderEmotionDist(){
+  const el=$('emo-dist');
+  const total=Object.values(emotions).reduce((a,b)=>a+b,0);
+  if(!total){el.innerHTML='<div style="color:#444;font-size:13px;padding:30px;text-align:center">No emotion data yet</div>';return;}
+  const sorted=Object.entries(emotions).sort((a,b)=>b[1]-a[1]);
+  el.innerHTML=sorted.map(([emo,cnt])=>{
+    const pct=Math.round(cnt/total*100);
+    const color=emoColors[emo]||'#555';
+    return '<div class="emo-bar"><span class="emoji">'+(emoEmoji[emo]||'')+'</span><div class="bar-bg"><div class="bar-fill" style="width:'+pct+'%;background:'+color+'"></div></div><span class="cnt">'+cnt+'</span></div>';
+  }).join('');
+}
+
+setInterval(()=>{
+  if(!startTime)return;
+  const s=Math.floor((Date.now()-startTime)/1000);
+  const m=Math.floor(s/60),h=Math.floor(m/60);
+  $('uptime').textContent=(h?h+'h ':'')+(m%60)+'m '+(s%60)+'s';
+},1000);
+
+async function loadSessions(){
+  const r=await fetch('/api/sessions');
+  const sessions=await r.json();
+  const el=$('sessions');
+  if(!sessions.length){el.innerHTML='<div style="color:#444;font-size:13px;padding:20px;text-align:center">No past sessions</div>';return;}
+  el.innerHTML=sessions.map(s=>{
+    const d=new Date(s.timestamp);
+    const t=d.toLocaleString();
+    return '<div class="session-item"><span>'+t+'</span><span class="meta">'+s.utterances+' utts \u00b7 '+(s.duration||0).toFixed(0)+'s \u00b7 '+s.photos+' photos</span></div>';
+  }).join('');
+}
+loadSessions();
+
+async function endSession(){
+  $('stop-btn').disabled=true;
+  $('stop-btn').textContent='Ending...';
+  await fetch('/api/end-session',{method:'POST'});
+  $('stop-btn').textContent='End Session';
+  $('stop-btn').disabled=false;
+}
+</script>
+</body></html>

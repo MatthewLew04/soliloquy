@@ -6,10 +6,12 @@ __pycache__/
 # Environment (API keys)
 .env
 
-# Recordings (audio data)
-server/recordings/*.raw
-server/recordings/*.wav
-server/recordings/*.txt
+# Recordings (audio, transcripts, photos)
+server/recordings/
+
+# Waveshare demo files
+waveshare_demo.zip
+waveshare_demo/
 
 # OS files
 .DS_Store
