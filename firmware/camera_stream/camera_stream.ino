@@ -25,11 +25,17 @@ bool wsConnected = false;
 #define I2C_SDA_PIN     11
 #define I2C_SCL_PIN     10
 
-// === I2S Pins (audio input) ===
+// === I2S Pins (audio input — ES7210 mic) ===
 #define I2S_MCLK_PIN    12
 #define I2S_BCK_PIN     13
 #define I2S_WS_PIN      14
 #define I2S_DIN_PIN     15
+
+// === I2S Pins (audio output — PCM5102A DAC) ===
+#define DAC_BCK_PIN     5
+#define DAC_DIN_PIN     6
+#define DAC_LCK_PIN     7
+#define DAC_I2S_NUM     I2S_NUM_1
 
 // === Camera DVP Pins (from official Waveshare Camera_Driver.h) ===
 #define CAM_PIN_XCLK    43
@@ -64,12 +70,14 @@ bool wsConnected = false;
 #define MSG_AUDIO       0x01
 #define MSG_PHOTO       0x02
 #define MSG_STATS       0x04
+#define MSG_PLAYBACK    0x05
 
 volatile bool captureRequested = false;
 unsigned long lastButtonPress = 0;
 unsigned long lastStatsSent = 0;
 bool audioRunning = false;
 bool cameraReady = false;
+bool dacRunning = false;
 
 // ============================================================
 // ES7210 Registers
@@ -239,12 +247,56 @@ void stopAudio() {
 }
 
 // ============================================================
-// Camera init — matches official Waveshare Camera_Init() exactly
+// DAC Output (I2S1 TX — PCM5102A)
+// ============================================================
+bool startDAC() {
+  if (dacRunning) return true;
+
+  i2s_config_t config = {};
+  config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  config.sample_rate = SAMPLE_RATE;
+  config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  config.dma_buf_count = 8;
+  config.dma_buf_len = 256;
+  config.use_apll = false;
+  config.tx_desc_auto_clear = true;
+
+  esp_err_t err = i2s_driver_install(DAC_I2S_NUM, &config, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("❌ DAC install failed: 0x%x\n", err);
+    return false;
+  }
+
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;  // PCM5102A uses internal PLL
+  pins.bck_io_num = DAC_BCK_PIN;
+  pins.ws_io_num = DAC_LCK_PIN;
+  pins.data_out_num = DAC_DIN_PIN;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+
+  err = i2s_set_pin(DAC_I2S_NUM, &pins);
+  if (err != ESP_OK) {
+    Serial.printf("❌ DAC pin config failed: 0x%x\n", err);
+    return false;
+  }
+
+  i2s_zero_dma_buffer(DAC_I2S_NUM);
+  dacRunning = true;
+  Serial.println("🔊 DAC started (BCK=5, DIN=6, LCK=7)");
+  return true;
+}
+
+// ============================================================
+// Camera init — called once at startup, stays running
+// With fb_count=2 + GRAB_LATEST, DVP stream is always managed
 // ============================================================
 bool initCamera() {
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_1;  // Timer 1 (official uses TIMER_1)
+  config.ledc_timer = LEDC_TIMER_1;
   config.pin_d0 = CAM_PIN_Y2;
   config.pin_d1 = CAM_PIN_Y3;
   config.pin_d2 = CAM_PIN_Y4;
@@ -257,35 +309,46 @@ bool initCamera() {
   config.pin_pclk = CAM_PIN_PCLK;
   config.pin_vsync = CAM_PIN_VSYNC;
   config.pin_href = CAM_PIN_HREF;
-  config.pin_sccb_sda = -1;          // Use existing I2C bus
-  config.pin_sccb_scl = -1;          // Use existing I2C bus
-  config.sccb_i2c_port = 0;          // I2C_NUM_0 (same as Wire)
+  config.pin_sccb_sda = -1;
+  config.pin_sccb_scl = -1;
+  config.sccb_i2c_port = 0;
   config.pin_pwdn = -1;
   config.pin_reset = -1;
-  config.xclk_freq_hz = 20000000;    // 20MHz (official)
+  config.xclk_freq_hz = 10000000;       // 10 MHz — slower clock = less DVP pressure
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.grab_mode = CAMERA_GRAB_LATEST; // Always get newest frame (needs fb_count >= 2)
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 10;
-  config.fb_count = 2;
-  config.frame_size = FRAMESIZE_VGA;  // 640x480
+  config.jpeg_quality = 12;              // Good quality, ~50% smaller than quality 6
+  config.fb_count = 2;                   // 2 buffers: DVP always has one to write to
+  config.frame_size = FRAMESIZE_UXGA;    // 1600x1200
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("📷 Camera init failed: 0x%x\n", err);
-    return false;
+    // Fallback to VGA
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+      Serial.printf("📷 Camera init failed: 0x%x\n", err);
+      return false;
+    }
   }
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    s->set_hmirror(s, 1);  // Match official
-    Serial.printf("📷 Camera ready! Sensor PID: 0x%04X\n", s->id.PID);
+    s->set_hmirror(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, 1);
+    s->set_sharpness(s, 2);
+    s->set_denoise(s, 1);
   }
+  Serial.println("📷 Camera initialized (UXGA, GRAB_LATEST)");
   return true;
 }
 
 // ============================================================
-// Capture photo
+// Capture photo — instant grab from always-running camera
+// GRAB_LATEST ensures we get the most recent frame immediately
 // ============================================================
 bool captureAndSendPhoto(uint8_t prefix = MSG_PHOTO) {
   if (!cameraReady) {
@@ -296,6 +359,7 @@ bool captureAndSendPhoto(uint8_t prefix = MSG_PHOTO) {
   if (prefix == MSG_PHOTO) Serial.println("📷 Capturing...");
   unsigned long t0 = millis();
 
+  // Grab latest frame — instant with GRAB_LATEST + fb_count=2
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("📷 Capture failed!");
@@ -317,6 +381,7 @@ bool captureAndSendPhoto(uint8_t prefix = MSG_PHOTO) {
   }
 
   esp_camera_fb_return(fb);
+
   if (prefix == MSG_PHOTO) Serial.printf("📷 Done in %lums\n", millis() - t0);
   return true;
 }
@@ -347,6 +412,28 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         captureRequested = true;
       }
       break;
+    case WStype_BIN:
+      // Server sends audio playback data with 0x05 prefix
+      if (length > 1 && payload[0] == MSG_PLAYBACK && dacRunning) {
+        size_t audioLen = length - 1;
+        uint8_t* audioData = payload + 1;
+        // Write PCM data to DAC (stereo: duplicate mono to both channels)
+        // Input is mono 16-bit PCM, output needs stereo for I2S
+        int16_t* monoSamples = (int16_t*)audioData;
+        int monoCount = audioLen / 2;
+        // Use PSRAM for stereo buffer if available
+        int16_t* stereoBuf = (int16_t*)ps_malloc(monoCount * 4);
+        if (stereoBuf) {
+          for (int i = 0; i < monoCount; i++) {
+            stereoBuf[i * 2]     = monoSamples[i];  // Left
+            stereoBuf[i * 2 + 1] = monoSamples[i];  // Right
+          }
+          size_t bytes_written;
+          i2s_write(DAC_I2S_NUM, stereoBuf, monoCount * 4, &bytes_written, portMAX_DELAY);
+          free(stereoBuf);
+        }
+      }
+      break;
     default: break;
   }
 }
@@ -364,19 +451,25 @@ void setup() {
   Serial.println("==============================");
   Serial.printf("PSRAM: %s (%d bytes)\n", psramFound() ? "YES" : "NO", ESP.getFreePsram());
 
-  // 1. I2C bus (shared: ES7210 + TCA9555 + camera SCCB)
+  // 1. WiFi FIRST (BLE provisioning needs RAM before hardware eats it)
+  //    If already provisioned, connects from NVS instantly.
+  //    If not, starts BLE → provision via phone app → BLE memory freed.
+  connectWiFiOrProvision();
+
+  // 2. I2C bus (shared: ES7210 + TCA9555 + camera SCCB)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
-  // 2. Enable camera via TCA9555 (must be before camera init)
+  // 3. Enable camera power via TCA9555, then init camera (stays running)
   enableCamera();
+  cameraReady = initCamera();  // Camera stays initialized — captures are instant
 
-  // 3. Init camera (uses shared I2C bus for SCCB, NO pin conflict with audio)
-  cameraReady = initCamera();
-
-  // 4. Start audio
+  // 5. Start audio (mic input)
   startAudio();
 
-  // 5. Button
+  // 6. Start DAC (audio output to PCM5102A headphones)
+  startDAC();
+
+  // 7. Button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, FALLING);
 
@@ -384,6 +477,7 @@ void setup() {
   wifiProvisionBegin();
 
   // 7. WebSocket
+  Serial.printf("Connecting to server: ws://%s:%d\n", getServerIP(), getServerPort());
   webSocket.begin(getServerIP(), getServerPort(), "/");
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(3000);
@@ -424,6 +518,7 @@ void sendDeviceStats() {
 static int16_t stereo_buf[1024];
 static int16_t mono_buf[512];
 static uint8_t send_buf[1025];
+static unsigned long lastCameraWarmup = 0;
 
 void loop() {
   webSocket.loop();

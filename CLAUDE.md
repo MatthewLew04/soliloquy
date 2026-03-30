@@ -16,12 +16,18 @@ cd server && node server.js
 # Start emotion worker (separate terminal)
 cd server && source emotion_venv/bin/activate && python emotion_worker.py
 
-# Compile firmware
-arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M firmware/camera_stream/camera_stream.ino
+# Compile firmware (PartitionScheme=huge_app required for BLE provisioning)
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M,PartitionScheme=huge_app firmware/camera_stream/camera_stream.ino
 
 # Flash firmware
-arduino-cli upload --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M -p /dev/cu.usbmodem2101 firmware/camera_stream/camera_stream.ino
+arduino-cli upload --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M,PartitionScheme=huge_app -p /dev/cu.usbmodem2101 firmware/camera_stream/camera_stream.ino
 ```
+
+## WiFi Provisioning (BLE)
+WiFi credentials are configured via BLE, not hardcoded. On first boot (or when saved WiFi fails), the board advertises as **"Soliloquy"** via BLE.
+1. Open **nRF Connect** (iOS/Android) → scan → connect to "Soliloquy"
+2. Write SSID, password, and server IP (`IP:PORT` format) to the 3 characteristics
+3. Credentials are saved to flash and persist across reboots
 
 ## WebSocket Protocol
 Binary messages with prefix byte:
@@ -46,5 +52,6 @@ Text messages: `CAPTURE` command (server → ESP32)
 ## Hardware
 - Board: Waveshare ESP32-S3-AUDIO
 - Camera: OV5640 (DVP interface via TCA9555 GPIO expander)
-- Mic: ES7210 quad-channel codec (I2S: MCLK=12, BCK=13, WS=14, DIN=15)
+- Mic: ES7210 quad-channel codec (I2S0: MCLK=12, BCK=13, WS=14, DIN=15)
+- DAC: PCM5102A breakout (I2S1: BCK=5, DIN=6, LCK=7, SCK→GND for internal PLL)
 - I2C: SDA=11, SCL=10

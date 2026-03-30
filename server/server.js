@@ -5,8 +5,18 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const os = require('os');
 const { execSync } = require('child_process');
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+const dgram = require('dgram');
+
+// OpenClaw integration
+const {
+  containsClawWord, extractClawQuery, matchIntent,
+  executeIntent, executeGeneralQuery, condensForGlasses,
+  checkOpenClaw,
+} = require('./openclaw_bridge');
+let openclawAvailable = false;
 
 // Emotion worker URL (Python Flask service)
 const EMOTION_WORKER_URL = 'http://localhost:5050/predict';
@@ -70,6 +80,48 @@ function analyzeEmotion(pcmBuffer) {
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+function geminiRequest(body, model = 'gemini-2.0-flash') {
+  return new Promise((resolve) => {
+    if (!GEMINI_API_KEY) return resolve(null);
+
+    const jsonBody = JSON.stringify(body);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+    const parsed = new URL(url);
+
+    const req = https.request({
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(jsonBody) },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (res.statusCode !== 200) {
+            console.error(`  Gemini HTTP ${res.statusCode}:`, data.slice(0, 300));
+            return resolve(null);
+          }
+          const text = json.candidates?.[0]?.content?.parts?.[0]?.text || null;
+          resolve(text);
+        } catch (e) {
+          console.error('  Gemini parse error:', e.message);
+          resolve(null);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      console.error('  Gemini API error:', err.message);
+      resolve(null);
+    });
+
+    req.write(jsonBody);
+    req.end();
+  });
+}
+
 function summarizeConversation(transcriptText, emotions) {
   return new Promise((resolve) => {
     if (!GEMINI_API_KEY) return resolve(null);
@@ -90,42 +142,218 @@ Provide a structured summary with:
 
 Keep the summary under 200 words. Be direct and specific.`;
 
-    const body = JSON.stringify({
+    geminiRequest({
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.3, maxOutputTokens: 500 },
-    });
+    }).then(resolve);
+  });
+}
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const parsed = new URL(url);
+// ============================================================
+// AI Agent — Gemini interjection engine
+// ============================================================
+const AGENT_COOLDOWN_MS = 8000;   // Min 8s between interjections
+const AGENT_CONTEXT_WINDOW = 6;   // Last N utterances for context
+
+// Wake word that activates the agent
+const WAKE_WORDS = ['ask', 'ask,', 'ask.'];
+function containsWakeWord(text) {
+  const words = text.toLowerCase().trim().split(/\s+/);
+  // Check if any word in the utterance IS "ask" (exact match, not substring)
+  return words.some(w => w.replace(/[,.:!?]/g, '') === 'ask');
+}
+// Strip the wake word and everything before it to get the question
+function extractQuestion(text) {
+  return text.replace(/^.*?\bask\b[,.:!?\s]*/i, '').trim();
+}
+
+const AGENT_SYSTEM_PROMPT = `You are a visual identification AI in smart glasses. The user says "ask" to activate you.
+
+CORE BEHAVIOR — always apply:
+- IDENTIFY SPECIFICALLY: brand names, product names, restaurant names, model numbers — never generic descriptions
+- BE CONCISE: 1-2 sentences max. State the identification + brief visual reasoning (logo, text, packaging, signage)
+- NO HEDGING: make your best call. If uncertain, state your best guess and briefly note why
+- NEVER ask follow-up questions — just answer
+- NEVER say NO_RESPONSE
+
+ADAPT TO CONTEXT:
+- PRODUCT (bottle, box, package, food item): "[Brand] [Product Name]" + what visual cues confirm it (logo color, label text, container shape)
+- MENU / RESTAURANT: identify the restaurant from signage, logo, or menu design. Use web search to find what's popular there, then recommend 2-3 specific dishes with one-line reasons
+- SIGN / TEXT: read and relay the text concisely
+- SCENE / LOCATION: identify the place, landmark, or setting specifically
+- PERSON / OBJECT: describe what's notable — clothing brands, device models, etc.
+
+WEB SEARCH: use automatically when identification would benefit from real-time info (restaurant reviews, product details, location info)
+
+If the user says "more", provide expanded details: ingredients, reviews, history, price range, nutritional info, or whatever is relevant to the identified item.`;
+
+// Pass 2: Condense a full answer into short TTS-friendly speech
+function condensForTTS(fullAnswer) {
+  return new Promise((resolve) => {
+    geminiRequest({
+      contents: [{ parts: [{ text: `Extract ONLY the key facts from this into 1-3 short spoken sentences. Keep ALL specific names, dish names, numbers, and recommendations. Remove filler and preamble. NEVER ask follow-up questions — just state the facts.
+
+Full answer:
+"${fullAnswer}"
+
+Condensed version:` }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 150 },
+    }, 'gemini-2.0-flash').then(text => {
+      if (!text || text.trim().length === 0) {
+        // Fallback: just truncate the original
+        resolve(fullAnswer.split('.').slice(0, 2).join('.') + '.');
+      } else {
+        resolve(text.trim());
+      }
+    });
+  });
+}
+
+// "more" follow-up: re-query with previous photo + "give me more details"
+function agentMore(photoBase64, previousAnswer) {
+  return new Promise((resolve) => {
+    if (!GEMINI_API_KEY) return resolve(null);
+
+    const parts = [];
+    if (photoBase64) {
+      parts.push({ inline_data: { mime_type: 'image/jpeg', data: photoBase64 } });
+    }
+    parts.push({ text: `You previously identified this as: "${previousAnswer}"\n\nThe user wants MORE details. Provide expanded information: ingredients, reviews, history, price, nutrition, comparisons, or whatever is most relevant. Be thorough but structured.` });
+
+    geminiRequest({
+      system_instruction: { parts: [{ text: AGENT_SYSTEM_PROMPT }] },
+      contents: [{ parts }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
+    }, 'gemini-2.5-flash').then(async (fullText) => {
+      console.log(`  📡 More (full): "${fullText}"`);
+      if (!fullText || fullText.trim().length === 0) return resolve(null);
+      if (fullText.trim().length < 150) return resolve(fullText.trim());
+      const condensed = await condensForTTS(fullText.trim());
+      console.log(`  📡 More (condensed): "${condensed}"`);
+      resolve(condensed);
+    });
+  });
+}
+
+function agentDecide(recentUtterances, photoBase64 = null) {
+  return new Promise((resolve) => {
+    if (!GEMINI_API_KEY) return resolve(null);
+
+    const lastUtt = recentUtterances[recentUtterances.length - 1];
+
+    // FAST PATH: No photo → simple factual Q&A, use gemini-2.0-flash (no search)
+    if (!photoBase64) {
+      const parts = [{ text: `Question: "${lastUtt.text}"\n\nAnswer in as few words as possible.` }];
+      geminiRequest({
+        system_instruction: { parts: [{ text: AGENT_SYSTEM_PROMPT }] },
+        contents: [{ parts }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 150 },
+      }, 'gemini-2.0-flash').then(text => {
+        console.log(`  📡 Fast path: "${text}"`);
+        resolve(!text || text.trim().length === 0 ? null : text.trim());
+      });
+      return;
+    }
+
+    // FULL PIPELINE: Photo → gemini-2.5-flash + web search + condense
+    const parts = [
+      { inline_data: { mime_type: 'image/jpeg', data: photoBase64 } },
+      { text: `A photo was just taken. Identify what you see. Question: "${lastUtt.text}"\n\nBe specific and concise (1-2 sentences).` }
+    ];
+
+    geminiRequest({
+      system_instruction: { parts: [{ text: AGENT_SYSTEM_PROMPT }] },
+      contents: [{ parts }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.3, maxOutputTokens: 1024 },
+    }, 'gemini-2.5-flash').then(async (fullText) => {
+      console.log(`  📡 Pass 1 (full): "${fullText}"`);
+      if (!fullText || fullText.trim().length === 0) return resolve(null);
+
+      // If already short enough, skip Pass 2
+      if (fullText.trim().length < 100) return resolve(fullText.trim());
+
+      // Pass 2: Condense for TTS
+      const condensed = await condensForTTS(fullText.trim());
+      console.log(`  📡 Pass 2 (condensed): "${condensed}"`);
+      resolve(condensed);
+    });
+  });
+}
+
+// ============================================================
+// Deepgram TTS — text to raw PCM audio
+// ============================================================
+
+// Speed up PCM audio by 1.5x (drop every 3rd sample pair)
+function speedUpAudio(pcmBuffer, factor = 1.5) {
+  const bytesPerSample = 2; // 16-bit
+  const totalSamples = pcmBuffer.length / bytesPerSample;
+  const outSamples = Math.floor(totalSamples / factor);
+  const out = Buffer.alloc(outSamples * bytesPerSample);
+  
+  for (let i = 0; i < outSamples; i++) {
+    const srcIdx = Math.floor(i * factor);
+    const srcOffset = srcIdx * bytesPerSample;
+    const dstOffset = i * bytesPerSample;
+    pcmBuffer.copy(out, dstOffset, srcOffset, srcOffset + bytesPerSample);
+  }
+  return out;
+}
+
+function textToSpeech(text) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ text });
+    const url = new URL('https://api.deepgram.com/v1/speak?model=aura-2-thalia-en&encoding=linear16&sample_rate=16000');
 
     const req = https.request({
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
+      hostname: url.hostname,
+      path: url.pathname + url.search,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      headers: {
+        'Authorization': `Token ${DEEPGRAM_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
     }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const text = json.candidates?.[0]?.content?.parts?.[0]?.text || null;
-          resolve(text);
-        } catch (e) {
-          console.error('  Gemini parse error:', e.message);
+        if (res.statusCode === 200) {
+          resolve(Buffer.concat(chunks));  // 1x speed, no processing
+        } else {
+          console.error(`  TTS error: ${res.statusCode}`, Buffer.concat(chunks).toString().slice(0, 200));
           resolve(null);
         }
       });
     });
 
     req.on('error', (err) => {
-      console.error('  Gemini API error:', err.message);
+      console.error('  TTS request error:', err.message);
       resolve(null);
     });
 
     req.write(body);
     req.end();
   });
+}
+
+// Send PCM audio to ESP32 in chunks with 0x05 prefix
+const MSG_PLAYBACK = 0x05;
+const AUDIO_CHUNK_SIZE = 1024;  // bytes per WebSocket frame
+
+function sendAudioToGlasses(ws, pcmBuffer) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  for (let offset = 0; offset < pcmBuffer.length; offset += AUDIO_CHUNK_SIZE) {
+    const chunk = pcmBuffer.slice(offset, offset + AUDIO_CHUNK_SIZE);
+    const frame = Buffer.alloc(1 + chunk.length);
+    frame[0] = MSG_PLAYBACK;
+    chunk.copy(frame, 1);
+    try { ws.send(frame); } catch(e) { break; }
+  }
+  console.log(`  🔊 Sent ${(pcmBuffer.length / 1024).toFixed(1)} KB audio to glasses`);
 }
 
 const app = express();
@@ -288,6 +516,55 @@ app.post('/api/end-session', (req, res) => {
 });
 
 // ============================================================
+// OpenClaw bridge endpoints
+// ============================================================
+app.use(express.json());
+
+// Speak through glasses
+app.post('/api/speak', async (req, res) => {
+  const { text } = req.body || {};
+  if (!text) return res.status(400).json({ error: 'Missing text field' });
+  if (!activeWs) return res.status(503).json({ error: 'Glasses not connected' });
+  try {
+    const pcmAudio = await textToSpeech(text);
+    if (pcmAudio && pcmAudio.length > 0) {
+      sendAudioToGlasses(activeWs, pcmAudio);
+      res.json({ ok: true, audio_bytes: pcmAudio.length });
+    } else {
+      res.status(500).json({ error: 'TTS failed' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Route a query through OpenClaw agent
+app.post('/api/openclaw', async (req, res) => {
+  const { message } = req.body || {};
+  if (!message) return res.status(400).json({ error: 'Missing message field' });
+  if (!openclawAvailable) return res.status(503).json({ error: 'OpenClaw not available' });
+  try {
+    const intent = matchIntent(message);
+    let result;
+    if (intent) {
+      result = await executeIntent(intent.intent, intent.params);
+    } else {
+      result = await executeGeneralQuery(message);
+    }
+    res.json({ ok: true, intent: intent?.intent?.id || 'general', response: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Read soul.md
+app.get('/api/soul', (req, res) => {
+  const soulPath = path.join(__dirname, '..', 'soul.md');
+  if (!fs.existsSync(soulPath)) return res.status(404).json({ error: 'soul.md not found' });
+  res.type('text/markdown').send(fs.readFileSync(soulPath, 'utf-8'));
+});
+
+// ============================================================
 // Speaker identification heuristic
 // ============================================================
 function identifySpeakers(utterances) {
@@ -348,6 +625,21 @@ wss.on('connection', (ws, req) => {
   let photoCount = 0;
   let wordCount = 0;
   let uttId = 0;
+
+  // Agent state
+  let lastAgentResponseTime = 0;
+  let lastPhotoBuffer = null;   // Most recent photo for vision queries
+  let agentProcessing = false;  // Prevent overlapping agent calls
+  let agentListening = false;   // True after wake word, waiting for question
+  let agentListenTimeout = null;
+  let agentSkipped = false;     // True when user says "skip" to abort response
+  let lastAgentAnswer = null;   // Store last answer for "more" follow-ups
+  let lastAgentPhotoB64 = null; // Store last photo used for "more" follow-ups
+
+  // OpenClaw state
+  let clawListening = false;        // True after "claw" wake, waiting for query
+  let clawListenTimeout = null;
+  let clawDictating = null;         // Pending two-step intent (reply/send): { intent, params }
 
   // Session tracking
   activeWs = ws;
@@ -470,6 +762,244 @@ wss.on('connection', (ws, req) => {
         if (lower.includes('picture') || lower.includes('photo') || lower.includes('take a pic')) {
           console.log('  \ud83d\udcf8 Voice trigger detected! Sending capture command...');
           try { ws.send('CAPTURE'); } catch (e) { /* ignore */ }
+          // Enter listening mode for vision question
+          agentListening = true;
+          if (agentListenTimeout) clearTimeout(agentListenTimeout);
+          agentListenTimeout = setTimeout(() => {
+            if (agentListening) { agentListening = false; console.log('  \ud83e\udde0 Picture listen window expired'); }
+          }, 15000);
+          console.log('  \ud83e\udde0 Photo taken! Listening for question about it...');
+        }
+
+        // --------------------------------------------------------
+        // AI Agent — skip command (abort pending response)
+        const lowerTrimmed = transcript.toLowerCase().trim();
+        if ((lowerTrimmed === 'skip' || lowerTrimmed === 'skip.' || lowerTrimmed === 'skip,') && agentProcessing) {
+          agentSkipped = true;
+          console.log('  ⏭️ Skip detected — will discard pending agent response');
+        }
+
+        // AI Agent — "more" command (expand previous answer)
+        const now = Date.now();
+        const hasRecentPhoto = lastPhotoBuffer && (now - (lastPhotoBuffer._timestamp || 0)) < 30000;
+
+        if ((lowerTrimmed === 'more' || lowerTrimmed === 'more.' || lowerTrimmed === 'more,') && lastAgentAnswer && !agentProcessing) {
+          console.log(`  🔍 More requested — expanding previous answer`);
+          const agentStart = Date.now();
+          agentProcessing = true;
+          agentSkipped = false;
+          agentMore(lastAgentPhotoB64, lastAgentAnswer).then(async (response) => {
+            agentProcessing = false;
+            if (agentSkipped) { agentSkipped = false; console.log('  ⏭️ More response skipped'); return; }
+            const geminiMs = Date.now() - agentStart;
+            if (!response) { console.log(`  🧠 More: NO_RESPONSE (${geminiMs}ms)`); return; }
+            lastAgentResponseTime = Date.now();
+            lastAgentAnswer = response;
+            console.log(`  🤖 More (${geminiMs}ms): "${response}"`);
+            sseNotify('agent', { text: response, timestamp: Date.now() });
+            const ttsStart = Date.now();
+            const pcmAudio = await textToSpeech(response);
+            if (pcmAudio && pcmAudio.length > 0) {
+              console.log(`  🔊 TTS (${Date.now() - ttsStart}ms): ${(pcmAudio.length / 1024).toFixed(1)} KB`);
+              sendAudioToGlasses(ws, pcmAudio);
+            }
+          }).catch(err => { agentProcessing = false; console.error('  More error:', err.message); });
+        }
+        // AI Agent — wake word activation
+        else if (containsWakeWord(transcript) && !agentProcessing) {
+          // Strip wake word to get the question part
+          let question = extractQuestion(transcript);
+          
+          if (question.length > 3 && question.split(' ').length >= 2) {
+            // Question in same utterance: "Ask, what year did WW2 end?"
+            agentListening = false;
+            if (agentListenTimeout) clearTimeout(agentListenTimeout);
+            
+            console.log(`  🧠 Ask detected: "${question}"`);
+            const agentStart = Date.now();
+            const recentUtts = utterances.slice(-AGENT_CONTEXT_WINDOW);
+            const photoB64 = hasRecentPhoto ? lastPhotoBuffer.toString('base64') : null;
+            
+            agentProcessing = true;
+            agentSkipped = false;
+            agentDecide(recentUtts, photoB64).then(async (response) => {
+              agentProcessing = false;
+              if (agentSkipped) { agentSkipped = false; console.log('  ⏭️ Agent response skipped'); return; }
+              const geminiMs = Date.now() - agentStart;
+              if (!response) { console.log(`  🧠 Agent: NO_RESPONSE (${geminiMs}ms)`); return; }
+              lastAgentResponseTime = Date.now();
+              lastAgentAnswer = response;           // Store for "more"
+              lastAgentPhotoB64 = photoB64;          // Store photo for "more"
+              console.log(`  🤖 Agent (${geminiMs}ms): "${response}"`);
+              sseNotify('agent', { text: response, timestamp: Date.now() });
+              const ttsStart = Date.now();
+              const pcmAudio = await textToSpeech(response);
+              if (pcmAudio && pcmAudio.length > 0) {
+                console.log(`  🔊 TTS (${Date.now() - ttsStart}ms): ${(pcmAudio.length / 1024).toFixed(1)} KB`);
+                sendAudioToGlasses(ws, pcmAudio);
+              }
+            }).catch(err => { agentProcessing = false; console.error('  Agent error:', err.message); });
+          } else {
+            // Just "ask" by itself — wait for next utterance
+            agentListening = true;
+            if (agentListenTimeout) clearTimeout(agentListenTimeout);
+            agentListenTimeout = setTimeout(() => {
+              if (agentListening) { agentListening = false; console.log('  🧠 Listen window expired'); }
+            }, 15000);
+            console.log('  🧠 "Ask" detected! Listening for question...');
+          }
+        }
+        // Fallback: if listening from a previous "ask", this utterance is the question
+        else if (agentListening && !agentProcessing && transcript.split(' ').length >= 2) {
+          agentListening = false;
+          if (agentListenTimeout) clearTimeout(agentListenTimeout);
+          
+          console.log(`  🧠 Got question: "${transcript}"`);
+          const agentStart = Date.now();
+          const recentUtts = utterances.slice(-AGENT_CONTEXT_WINDOW);
+          const photoB64 = hasRecentPhoto ? lastPhotoBuffer.toString('base64') : null;
+          
+          agentProcessing = true;
+          agentSkipped = false;
+          agentDecide(recentUtts, photoB64).then(async (response) => {
+            agentProcessing = false;
+            if (agentSkipped) { agentSkipped = false; console.log('  ⏭️ Agent response skipped'); return; }
+            const geminiMs = Date.now() - agentStart;
+            if (!response) { console.log(`  🧠 Agent: NO_RESPONSE (${geminiMs}ms)`); return; }
+            lastAgentResponseTime = Date.now();
+            lastAgentAnswer = response;           // Store for "more"
+            lastAgentPhotoB64 = photoB64;          // Store photo for "more"
+            console.log(`  🤖 Agent (${geminiMs}ms): "${response}"`);
+            sseNotify('agent', { text: response, timestamp: Date.now() });
+            const ttsStart = Date.now();
+            const pcmAudio = await textToSpeech(response);
+            if (pcmAudio && pcmAudio.length > 0) {
+              console.log(`  🔊 TTS (${Date.now() - ttsStart}ms): ${(pcmAudio.length / 1024).toFixed(1)} KB`);
+              sendAudioToGlasses(ws, pcmAudio);
+            }
+          }).catch(err => { agentProcessing = false; console.error('  Agent error:', err.message); });
+        }
+
+        // --------------------------------------------------------
+        // OpenClaw — two-step dictation (reply/send body capture)
+        // --------------------------------------------------------
+        else if (clawDictating && !agentProcessing && transcript.split(' ').length >= 2) {
+          const pending = clawDictating;
+          clawDictating = null;
+          pending.params.body = transcript;
+          console.log(`  🦞 Claw dictation body: "${transcript}"`);
+
+          agentProcessing = true;
+          agentSkipped = false;
+          const clawStart = Date.now();
+          executeIntent(pending.intent, pending.params).then(async (result) => {
+            agentProcessing = false;
+            if (agentSkipped) { agentSkipped = false; console.log('  ⏭️ Claw response skipped'); return; }
+            const ttsText = condensForGlasses(result);
+            console.log(`  🦞 Claw result (${Date.now() - clawStart}ms): "${ttsText}"`);
+            sseNotify('agent', { text: `[OpenClaw] ${ttsText}`, timestamp: Date.now() });
+            const pcmAudio = await textToSpeech(ttsText);
+            if (pcmAudio && pcmAudio.length > 0) {
+              sendAudioToGlasses(ws, pcmAudio);
+            }
+          }).catch(err => { agentProcessing = false; console.error('  Claw dictation error:', err.message); });
+        }
+
+        // --------------------------------------------------------
+        // OpenClaw — "claw" wake word activation
+        // --------------------------------------------------------
+        else if (containsClawWord(transcript) && !agentProcessing && openclawAvailable) {
+          const clawQuery = extractClawQuery(transcript);
+
+          if (clawQuery.length > 3 && clawQuery.split(' ').length >= 2) {
+            // Query in same utterance: "Claw, what's in my mail"
+            clawListening = false;
+            if (clawListenTimeout) clearTimeout(clawListenTimeout);
+
+            console.log(`  🦞 Claw detected: "${clawQuery}"`);
+            const matched = matchIntent(clawQuery);
+
+            if (matched && matched.intent.needsFollowUp) {
+              // Two-step: need the message body next
+              clawDictating = matched;
+              console.log(`  🦞 Waiting for dictation body (${matched.intent.id})...`);
+              (async () => {
+                const pcmAudio = await textToSpeech(`OK, what should I say to ${matched.params.contact}?`);
+                if (pcmAudio && pcmAudio.length > 0) sendAudioToGlasses(ws, pcmAudio);
+              })();
+            } else {
+              // Execute immediately
+              agentProcessing = true;
+              agentSkipped = false;
+              const clawStart = Date.now();
+              const intentToRun = matched ? matched.intent : null;
+              const paramsToRun = matched ? matched.params : {};
+
+              const execPromise = intentToRun
+                ? executeIntent(intentToRun, paramsToRun)
+                : executeGeneralQuery(clawQuery);
+
+              execPromise.then(async (result) => {
+                agentProcessing = false;
+                if (agentSkipped) { agentSkipped = false; console.log('  ⏭️ Claw response skipped'); return; }
+                const clawMs = Date.now() - clawStart;
+                const ttsText = condensForGlasses(result);
+                lastAgentAnswer = ttsText;
+                console.log(`  🦞 Claw (${clawMs}ms): "${ttsText}"`);
+                sseNotify('agent', { text: `[OpenClaw] ${ttsText}`, timestamp: Date.now() });
+                const pcmAudio = await textToSpeech(ttsText);
+                if (pcmAudio && pcmAudio.length > 0) {
+                  sendAudioToGlasses(ws, pcmAudio);
+                }
+              }).catch(err => { agentProcessing = false; console.error('  Claw error:', err.message); });
+            }
+          } else {
+            // Just "claw" by itself — wait for next utterance
+            clawListening = true;
+            if (clawListenTimeout) clearTimeout(clawListenTimeout);
+            clawListenTimeout = setTimeout(() => {
+              if (clawListening) { clawListening = false; console.log('  🦞 Claw listen window expired'); }
+            }, 15000);
+            console.log('  🦞 "Claw" detected! Listening for command...');
+          }
+        }
+
+        // OpenClaw — fallback: if listening from a previous "claw", this is the query
+        else if (clawListening && !agentProcessing && openclawAvailable && transcript.split(' ').length >= 2) {
+          clawListening = false;
+          if (clawListenTimeout) clearTimeout(clawListenTimeout);
+
+          console.log(`  🦞 Got claw query: "${transcript}"`);
+          const matched = matchIntent(transcript);
+
+          if (matched && matched.intent.needsFollowUp) {
+            clawDictating = matched;
+            console.log(`  🦞 Waiting for dictation body (${matched.intent.id})...`);
+            (async () => {
+              const pcmAudio = await textToSpeech(`OK, what should I say to ${matched.params.contact}?`);
+              if (pcmAudio && pcmAudio.length > 0) sendAudioToGlasses(ws, pcmAudio);
+            })();
+          } else {
+            agentProcessing = true;
+            agentSkipped = false;
+            const clawStart = Date.now();
+            const execPromise = matched
+              ? executeIntent(matched.intent, matched.params)
+              : executeGeneralQuery(transcript);
+
+            execPromise.then(async (result) => {
+              agentProcessing = false;
+              if (agentSkipped) { agentSkipped = false; console.log('  ⏭️ Claw response skipped'); return; }
+              const ttsText = condensForGlasses(result);
+              lastAgentAnswer = ttsText;
+              console.log(`  🦞 Claw (${Date.now() - clawStart}ms): "${ttsText}"`);
+              sseNotify('agent', { text: `[OpenClaw] ${ttsText}`, timestamp: Date.now() });
+              const pcmAudio = await textToSpeech(ttsText);
+              if (pcmAudio && pcmAudio.length > 0) {
+                sendAudioToGlasses(ws, pcmAudio);
+              }
+            }).catch(err => { agentProcessing = false; console.error('  Claw error:', err.message); });
+          }
         }
       });
 
@@ -500,12 +1030,27 @@ wss.on('connection', (ws, req) => {
       photoCount++;
       const photoFilename = `${timestamp}_photo_${photoCount}.jpg`;
       const photoPath = path.join(recordingsDir, photoFilename);
-      fs.writeFileSync(photoPath, payload);
-      console.log(`  \ud83d\udcf7 Photo saved: ${photoFilename} (${(payload.length / 1024).toFixed(0)} KB)`);
+      
+      // Rotate 90° clockwise (camera sensor is mounted sideways)
+      let rotatedPayload = payload;
+      try {
+        rotatedPayload = execSync(
+          'ffmpeg -f mjpeg -i pipe:0 -vf "transpose=2" -f mjpeg -q:v 1 pipe:1',
+          { input: payload, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
+        );
+      } catch (e) {
+        console.log('  ⚠️ Photo rotation failed, saving original');
+      }
+      
+      fs.writeFileSync(photoPath, rotatedPayload);
+      console.log(`  📷 Photo saved: ${photoFilename} (${(rotatedPayload.length / 1024).toFixed(0)} KB)`);
       if (currentSession) currentSession.photoCount = photoCount;
-      sseNotify('photo', { filename: photoFilename, size: payload.length });
+      sseNotify('photo', { filename: photoFilename, size: rotatedPayload.length });
       sseNotify('stats', currentSession);
-      if (ws._oncePhoto) { ws._oncePhoto(payload); ws._oncePhoto = null; }
+      if (ws._oncePhoto) { ws._oncePhoto(rotatedPayload); ws._oncePhoto = null; }
+      // Store for agent vision queries
+      lastPhotoBuffer = Buffer.from(rotatedPayload);
+      lastPhotoBuffer._timestamp = Date.now();
       return;
     }
 
@@ -640,7 +1185,32 @@ wss.on('connection', (ws, req) => {
 // Start server
 // ============================================================
 app.listen(HTTP_PORT, async () => {
+  // UDP discovery — respond to ESP32 broadcast with our IP + port
+  const discoveryPort = 5555;
+  const udpServer = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  udpServer.on('message', (msg, rinfo) => {
+    if (msg.toString().trim() === 'SOLILOQUY_DISCOVER') {
+      // Get our IP on the same interface the request came from
+      const nets = os.networkInterfaces();
+      let myIP = '0.0.0.0';
+      for (const name of Object.keys(nets)) {
+        for (const net of nets[name]) {
+          if (net.family === 'IPv4' && !net.internal) { myIP = net.address; break; }
+        }
+        if (myIP !== '0.0.0.0') break;
+      }
+      const response = Buffer.from(`SOLILOQUY_SERVER ${myIP} ${WS_PORT}`);
+      udpServer.send(response, rinfo.port, rinfo.address);
+      console.log(`  📡 Discovery: replied to ${rinfo.address} → ${myIP}:${WS_PORT}`);
+    }
+  });
+  udpServer.bind(discoveryPort, () => {
+    udpServer.setBroadcast(true);
+    console.log(`  📡 Discovery: listening for UDP broadcasts on port ${discoveryPort}`);
+  });
+
   await checkEmotionWorker();
+  openclawAvailable = await checkOpenClaw();
 
   if (!emotionWorkerAvailable) {
     const recheck = setInterval(async () => {
@@ -652,6 +1222,16 @@ app.listen(HTTP_PORT, async () => {
     }, 10000);
   }
 
+  if (!openclawAvailable) {
+    const recheckClaw = setInterval(async () => {
+      openclawAvailable = await checkOpenClaw();
+      if (openclawAvailable) {
+        console.log('  \u2705 OpenClaw now available!');
+        clearInterval(recheckClaw);
+      }
+    }, 15000);
+  }
+
   console.log('');
   console.log('=== Soliloquy Server ===');
   console.log(`  HTTP dashboard:    http://localhost:${HTTP_PORT}/dashboard`);
@@ -659,8 +1239,12 @@ app.listen(HTTP_PORT, async () => {
   console.log(`  Recordings dir:    ${recordingsDir}`);
   console.log(`  Deepgram:          ${deepgram ? '\u2705 enabled' : '\u274c disabled (no API key)'}`);
   console.log(`  Emotion worker:    ${emotionWorkerAvailable ? '\u2705 connected (localhost:5050)' : '\u23f3 waiting (will auto-detect)'}`);
+  console.log(`  OpenClaw:          ${openclawAvailable ? '\u2705 connected (say "claw" to activate)' : '\u23f3 waiting (will auto-detect)'}`);
   console.log(`  OpenClaw vision:   http://localhost:${HTTP_PORT}/api/vision`);
   console.log(`  OpenClaw context:  http://localhost:${HTTP_PORT}/api/context`);
+  console.log(`  OpenClaw speak:    http://localhost:${HTTP_PORT}/api/speak`);
+  console.log(`  OpenClaw query:    http://localhost:${HTTP_PORT}/api/openclaw`);
+  console.log(`  AI Agent:          ${GEMINI_API_KEY ? '\u2705 enabled (Gemini + Deepgram TTS)' : '\u274c disabled (no Gemini key)'}`);
   console.log('');
   console.log('Waiting for glasses to connect...');
   console.log('');

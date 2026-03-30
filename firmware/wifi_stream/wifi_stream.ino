@@ -15,6 +15,9 @@
  *   I2S LRCLK = GPIO14  (word select)
  *   I2S DSIN  = GPIO15  (data IN from ES7210 mics → ESP32)
  *
+ * WiFi credentials: configured via BLE (nRF Connect → "Soliloquy")
+ *   Saved to flash, persists across reboots.
+ *
  * Required library: WebSockets by Links2004
  *   Install via: arduino-cli lib install "WebSockets"
  */
@@ -23,15 +26,7 @@
 #include <WebSocketsClient.h>
 #include <Wire.h>
 #include <driver/i2s.h>
-
-// ============================================================
-// ⚠️  CONFIGURE THESE BEFORE FLASHING
-// ============================================================
-const char* WIFI_SSID   = "103";
-const char* WIFI_PASS   = "vanitas14850";     // ← PUT YOUR WIFI PASSWORD HERE
-const char* SERVER_IP   = "10.0.0.28";
-const int   SERVER_PORT = 8080;
-// ============================================================
+#include "../wifi_provision.h"
 
 WebSocketsClient webSocket;
 bool wsConnected = false;
@@ -223,25 +218,12 @@ void setup() {
   // 3. Init ES7210 ADC (needs MCLK running)
   initES7210();
 
-  // 4. Connect to WiFi
-  Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-    if (attempts > 30) {
-      Serial.println("\n⚠️  WiFi connection failed after 15 seconds!");
-      Serial.println("Check SSID and password, then reset the board.");
-      while (true) { delay(1000); }
-    }
-  }
-  Serial.printf("\n✅ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+  // 4. Connect to WiFi (via saved creds or BLE provisioning)
+  connectWiFiOrProvision();
 
   // 5. Connect WebSocket to server
-  Serial.printf("Connecting to server: ws://%s:%d\n", SERVER_IP, SERVER_PORT);
-  webSocket.begin(SERVER_IP, SERVER_PORT, "/");
+  Serial.printf("Connecting to server: ws://%s:%d\n", provConfig.serverIP, provConfig.serverPort);
+  webSocket.begin(provConfig.serverIP, provConfig.serverPort, "/");
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(3000);
 
