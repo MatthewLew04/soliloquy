@@ -16,15 +16,7 @@
 #include <Wire.h>
 #include <driver/i2s.h>
 #include "esp_camera.h"
-
-// ============================================================
-// ⚠️  CONFIGURE THESE BEFORE FLASHING
-// ============================================================
-const char* WIFI_SSID   = "103";
-const char* WIFI_PASS   = "vanitas14850";
-const char* SERVER_IP   = "10.0.0.28";
-const int   SERVER_PORT = 8080;
-// ============================================================
+#include "wifi_provision.h"
 
 WebSocketsClient webSocket;
 bool wsConnected = false;
@@ -388,14 +380,11 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, FALLING);
 
-  // 6. WiFi
-  Serial.printf("WiFi: %s", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.printf("\n✅ WiFi: %s\n", WiFi.localIP().toString().c_str());
+  // 6. WiFi (provisioning: NVS credentials or captive-portal AP)
+  wifiProvisionBegin();
 
   // 7. WebSocket
-  webSocket.begin(SERVER_IP, SERVER_PORT, "/");
+  webSocket.begin(getServerIP(), getServerPort(), "/");
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(3000);
 
