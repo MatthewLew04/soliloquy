@@ -451,10 +451,6 @@ void setup() {
   Serial.println("==============================");
   Serial.printf("PSRAM: %s (%d bytes)\n", psramFound() ? "YES" : "NO", ESP.getFreePsram());
 
-  // 1. WiFi FIRST (BLE provisioning needs RAM before hardware eats it)
-  //    If already provisioned, connects from NVS instantly.
-  //    If not, starts BLE → provision via phone app → BLE memory freed.
-  connectWiFiOrProvision();
 
   // 2. I2C bus (shared: ES7210 + TCA9555 + camera SCCB)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);

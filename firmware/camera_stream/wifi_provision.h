@@ -19,6 +19,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <WiFiUdp.h>
 
 // ── Defaults (used if NVS is empty) ─────────────────────────
 #define WP_DEFAULT_SSID        ""
@@ -248,6 +249,48 @@ static bool _wp_connectSTA() {
   return false;
 }
 
+// ── UDP Server Discovery ────────────────────────────────────
+static bool _wp_discoverServer() {
+  Serial.println("[WP] Searching for Soliloquy server via UDP broadcast...");
+
+  WiFiUDP udp;
+  if (!udp.begin(5556)) {
+    Serial.println("[WP] UDP init failed, using saved server IP");
+    return false;
+  }
+
+  const char* msg = "SOLILOQUY_DISCOVER";
+  IPAddress broadcast(255, 255, 255, 255);
+  udp.beginPacket(broadcast, 5555);
+  udp.write((const uint8_t*)msg, strlen(msg));
+  udp.endPacket();
+
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    int packetSize = udp.parsePacket();
+    if (packetSize > 0) {
+      char buf[128] = {0};
+      udp.read(buf, sizeof(buf) - 1);
+
+      char prefix[32], ip[64];
+      int port;
+      if (sscanf(buf, "%s %s %d", prefix, ip, &port) == 3 &&
+          strcmp(prefix, "SOLILOQUY_SERVER") == 0) {
+        strlcpy(_wp_server_ip, ip, sizeof(_wp_server_ip));
+        _wp_server_port = port;
+        Serial.printf("[WP] Found server: %s:%d\n", _wp_server_ip, _wp_server_port);
+        udp.stop();
+        return true;
+      }
+    }
+    delay(50);
+  }
+
+  udp.stop();
+  Serial.printf("[WP] No server found, using saved: %s:%d\n", _wp_server_ip, _wp_server_port);
+  return false;
+}
+
 // ── Public API ──────────────────────────────────────────────
 
 /*
@@ -257,7 +300,10 @@ static bool _wp_connectSTA() {
 void wifiProvisionBegin() {
   _wp_loadPrefs();
 
-  if (_wp_connectSTA()) return;
+  if (_wp_connectSTA()) {
+    _wp_discoverServer();
+    return;
+  }
 
   // No valid credentials or connection failed — start captive portal
   Serial.println("[WP] Starting provisioning portal...");
@@ -268,6 +314,8 @@ void wifiProvisionBegin() {
     Serial.println("[WP] Still can't connect — restarting...");
     ESP.restart();
   }
+  
+  _wp_discoverServer();
 }
 
 /*
